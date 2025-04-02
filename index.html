@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Three.js Fluid Simulation</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; }
+        canvas { display: block; }
+        #info {
+            position: absolute;
+            top: 10px;
+            width: 100%;
+            text-align: center;
+            color: white;
+            font-family: monospace;
+            z-index: 100;
+        }
+    </style>
+</head>
+<body>
+    <div id="info">Move mouse to stir the fluid</div>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.163.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.163.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="x-shader/x-vertex" id="vertexShader">
+        varying vec2 vUv;
+        void main() {
+            vUv = uv;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+    </script>
+
+    <script type="x-shader/x-fragment" id="advectionShader">
+        precision highp float;
+        precision highp sampler2D;
+
+        varying vec2 vUv;
+        uniform sampler2D uVelocity;  // Velocity field texture
+        uniform sampler2D uSource;    // Texture to advect (either velocity or density)
+        uniform vec2 texelSize;       // Size of one texel: 1.0 / resolution
+        uniform float dt;             // Time step
+        uniform float dissipation;    // How much the quantity dissipates over time
+
+        void main() {
+            // Sample velocity at the current fragment's position
+            vec2 vel = texture2D(uVelocity, vUv).xy;
+
+            // Calculate the position where the fluid parcel came from (backwards tracing)
+            vec2 coord = vUv - vel * dt * texelSize;
+
+            // Sample the source texture at the calculated past position (bilinear interpolation is done by default)
+            vec4 result = texture2D(uSource, coord);
+
+            // Apply dissipation (decay)
+            result *= (1.0 - dissipation * dt); // Simple linear dissipation
+
+            gl_FragColor = result;
+        }
+    </script>
+
+     <script type="x-shader/x-fragment" id="splatShader">
+        precision highp float;
+        precision highp sampler2D;
+
+        varying vec2 vUv;
+        uniform sampler2D uTarget;      // Texture to add the splat onto (velocity or density)
+        uniform float aspectRatio;    // Canvas aspect ratio (width / height)
+        uniform vec3 color;           // Color of the splat (for density) or force vector (for velocity, z=0)
+        uniform vec2 point;           // Center of the splat in texture coordinates [0, 1]
+        uniform float radius;         // Radius of the splat
+
+        void main() {
+            // Calculate distance from the splat center, adjusting for aspect ratio
+            vec2 p = vUv - point;
+            p.x *= aspectRatio; // Make the splat circular in screen space
+
+            // Calculate splat intensity using a Gaussian-like falloff
+            float intensity = exp(-dot(p, p) / radius);
+
+            // Get the current value from the target texture
+            vec3 base = texture2D(uTarget, vUv).rgb;
+
+            // Add the splat intensity multiplied by the color/force
+            gl_FragColor = vec4(base + intensity * color, 1.0);
+        }
+    </script>
+
+    <script type="x-shader/x-fragment" id="divergenceShader">
+        precision mediump float;
+        precision mediump sampler2D;
+
+        varying highp vec2 vUv;
+        uniform sampler2D uVelocity; // Velocity field texture
+        uniform vec2 texelSize;      // Size of one texel
+
+        void main () {
+            // Sample velocity at neighboring texels
+            float L = texture2D(uVelocity, vUv - vec2(texelSize.x, 0.0)).x; // Left
+            float R = texture2D(uVelocity, vUv + vec2(texelSize.x, 0.0)).x; // Right
+            float B = texture2D(uVelocity, vUv - vec2(0.0, texelSize.y)).y; // Bottom
+            float T = texture2D(uVelocity, vUv + vec2(0.0, texelSize.y)).y; // Top
+
+            // Calculate divergence using central differencing
+            // div = 0.5 * dVx/dx + 0.5 * dVy/dy
+            float divergence = 0.5 * (R - L + T - B); // Note: texelSize is implicitly included
+
+            // Store divergence in the red channel
+            gl_FragColor = vec4(divergence, 0.0, 0.0, 1.0);
+        }
+    </script>
+
+    <script type="x-shader/x-fragment" id="pressureShader">
+        precision mediump float;
+        precision mediump sampler2D;
+
+        varying highp vec2 vUv;
+        uniform sampler2D uPressure;    // Pressure field from previous iteration
+        uniform sampler2D uDivergence;  // Divergence field
+        uniform vec2 texelSize;         // Size of one texel
+        // The relaxation factor alpha is implicitly 1/4 for this discretization
+
+        void main () {
+            // Sample pressure at neighboring texels from the previous iteration
+            float L = texture2D(uPressure, vUv - vec2(texelSize.x, 0.0)).x;
+            float R = texture2D(uPressure, vUv + vec2(texelSize.x, 0.0)).x;
+            float B = texture2D(uPressure, vUv - vec2(0.0, texelSize.y)).x;
+            float T = texture2D(uPressure, vUv + vec2(0.0, texelSize.y)).x;
+
+            // Sample divergence at the current texel
+            float divergence = texture2D(uDivergence, vUv).x;
+
+            // Jacobi iteration step to solve the Poisson equation:
+            // P_new = (P_L + P_R + P_B + P_T - divergence * dx^2) / 4
+            // Assuming dx = 1 for simplicity in shader units, we adjust later if needed
+            float pressure = (L + R + B + T - divergence) * 0.25; // alpha = 1/4
+
+            gl_FragColor = vec4(pressure, 0.0, 0.0, 1.0);
+        }
+    </script>
+
+    <script type="x-shader/x-fragment" id="gradientSubtractShader">
+        precision mediump float;
+        precision mediump sampler2D;
+
+        varying highp vec2 vUv;
+        uniform sampler2D uPressure; // Solved pressure field
+        uniform sampler2D uVelocity; // Divergent velocity field
+        uniform vec2 texelSize;      // Size of one texel
+
+        void main () {
+            // Sample pressure at neighboring texels
+            float L = texture2D(uPressure, vUv - vec2(texelSize.x, 0.0)).x;
+            float R = texture2D(uPressure, vUv + vec2(texelSize.x, 0.0)).x;
+            float B = texture2D(uPressure, vUv - vec2(0.0, texelSize.y)).x;
+            float T = texture2D(uPressure, vUv + vec2(0.0, texelSize.y)).x;
+
+            // Calculate the pressure gradient using central differencing
+            // gradP = ( (P_R - P_L) / (2*dx), (P_T - P_B) / (2*dy) )
+            vec2 gradP = vec2(R - L, T - B) * 0.5; // Again, assuming dx=dy=1 in shader units
+
+            // Sample the divergent velocity
+            vec2 velocity = texture2D(uVelocity, vUv).xy;
+
+            // Subtract the pressure gradient to make the velocity field divergence-free
+            // V_new = V_old - gradP * dt (dt often absorbed into pressure term or handled elsewhere)
+            velocity -= gradP;
+
+            gl_FragColor = vec4(velocity, 0.0, 1.0); // Store corrected velocity (z=0, w=1)
+        }
+    </script>
+
+     <script type="x-shader/x-fragment" id="displayShader">
+        precision mediump float;
+        precision mediump sampler2D;
+
+        varying vec2 vUv;
+        uniform sampler2D uTexture; // Texture to display (e.g., density)
+
+        void main() {
+            // Sample the texture
+            vec4 color = texture2D(uTexture, vUv);
+
+            // Just display the color directly for now
+            // Could add shading, bloom, etc. here later
+            gl_FragColor = color;
+             // Simple visualization: map density (r,g,b) to grayscale or use directly
+            // gl_FragColor = vec4(color.rgb, 1.0); // Display density color
+             // gl_FragColor = vec4(vec3(length(color.rgb)), 1.0); // Display density magnitude
+        }
+    </script>
+
+
+    <script type="module">
+        import * as THREE from 'three';
+
+        // --- Configuration ---
+        const SIM_RESOLUTION = 128; // Resolution of the simulation grid
+        const DYE_RESOLUTION = 512; // Resolution of the dye texture (visuals)
+        const PRESSURE_ITERATIONS = 20; // Number of Jacobi iterations for pressure solve
+        const DENSITY_DISSIPATION = 0.99; // How quickly density fades (closer to 1 = slower fade)
+        const VELOCITY_DISSIPATION = 0.98; // How quickly velocity fades
+        const SPLAT_RADIUS = 0.005; // Radius of the mouse splat (in texture coords)
+        const SPLAT_FORCE = 500; // Force applied by mouse velocity splat
+        const SPLAT_DENSITY = 1.0; // Density added by mouse splat
+
+        // --- Global Variables ---
+        let scene, camera, renderer;
+        let simWidth, simHeight, dyeWidth, dyeHeight;
+        let velocityRT1, velocityRT2, densityRT1, densityRT2, pressureRT1, pressureRT2, divergenceRT;
+        let advectionMaterial, splatMaterial, divergenceMaterial, pressureMaterial, gradientSubtractMaterial, displayMaterial;
+        let quadMesh; // Fullscreen quad for rendering simulation steps
+        let clock;
+        let mouse = { x: 0, y: 0, dx: 0, dy: 0, isDown: false, moved: false };
+        let lastMousePos = { x: 0, y: 0 };
+
+        // --- Initialization ---
+        function init() {
+            clock = new THREE.Clock();
+            scene = new THREE.Scene();
+
+            // Orthographic camera for 2D rendering
+            camera = new THREE.OrthographicCamera(-0.5, 0.5, 0.5, -0.5, 0.1, 10);
+            camera.position.z = 1;
+
+            renderer = new THREE.WebGLRenderer({ antialias: false }); // No AA needed for simulation
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio); // Use device pixel ratio
+            document.body.appendChild(renderer.domElement);
+
+            calculateResolution();
+            createRenderTargets();
+            createMaterials();
+            createQuadMesh();
+
+            addEventListeners();
+            animate();
+        }
+
+        // --- Resolution Calculation ---
+        function calculateResolution() {
+            const aspectRatio = window.innerWidth / window.innerHeight;
+            if (aspectRatio > 1) { // Landscape
+                simWidth = SIM_RESOLUTION * aspectRatio;
+                simHeight = SIM_RESOLUTION;
+                dyeWidth = DYE_RESOLUTION * aspectRatio;
+                dyeHeight = DYE_RESOLUTION;
+            } else { // Portrait or Square
+                simWidth = SIM_RESOLUTION;
+                simHeight = SIM_RESOLUTION / aspectRatio;
+                dyeWidth = DYE_RESOLUTION;
+                dyeHeight = DYE_RESOLUTION / aspectRatio;
+            }
+            // Ensure integer dimensions
+            simWidth = Math.round(simWidth);
+            simHeight = Math.round(simHeight);
+            dyeWidth = Math.round(dyeWidth);
+            dyeHeight = Math.round(dyeHeight);
+        }
+
+        // --- Render Target Creation ---
+        function createRenderTargets() {
+            const simOptions = {
+                type: THREE.FloatType, // Use floats for precision
+                minFilter: THREE.LinearFilter,
+                magFilter: THREE.LinearFilter, // Linear filtering for smoother results
+                format: THREE.RGBAFormat, // RG for velocity, R for pressure/divergence (using RGBA for compatibility)
+                stencilBuffer: false,
+            };
+            const dyeOptions = { // Can use HalfFloat for dye if memory is an issue
+                type: THREE.FloatType, // Float or HalfFloatType
+                minFilter: THREE.LinearFilter,
+                magFilter: THREE.LinearFilter,
+                format: THREE.RGBAFormat,
+                stencilBuffer: false,
+            };
+
+            // Velocity (stores vec2, using RGBA texture)
+            velocityRT1 = new THREE.WebGLRenderTarget(simWidth, simHeight, simOptions);
+            velocityRT2 = new THREE.WebGLRenderTarget(simWidth, simHeight, simOptions);
+            // Density (stores vec3 color, using RGBA texture)
+            densityRT1 = new THREE.WebGLRenderTarget(dyeWidth, dyeHeight, dyeOptions);
+            densityRT2 = new THREE.WebGLRenderTarget(dyeWidth, dyeHeight, dyeOptions);
+            // Pressure (stores scalar, using RGBA texture - R channel)
+            pressureRT1 = new THREE.WebGLRenderTarget(simWidth, simHeight, simOptions);
+            pressureRT2 = new THREE.WebGLRenderTarget(simWidth, simHeight, simOptions);
+            // Divergence (stores scalar, using RGBA texture - R channel)
+            divergenceRT = new THREE.WebGLRenderTarget(simWidth, simHeight, simOptions);
+        }
+
+        // --- Material Creation ---
+        function createMaterials() {
+            const simTexelSize = new THREE.Vector2(1.0 / simWidth, 1.0 / simHeight);
+            const dyeTexelSize = new THREE.Vector2(1.0 / dyeWidth, 1.0 / dyeHeight);
+
+            advectionMaterial = new THREE.ShaderMaterial({
+                vertexShader: document.getElementById('vertexShader').textContent,
+                fragmentShader: document.getElementById('advectionShader').textContent,
+                uniforms: {
+                    uVelocity: { value: null }, // Set dynamically
+                    uSource: { value: null },   // Set dynamically
+                    texelSize: { value: simTexelSize }, // Use simTexelSize for velocity advection
+                    dt: { value: 0.0 },         // Set dynamically
+                    dissipation: { value: 0.0 } // Set dynamically
+                },
+                depthTest: false,
+                depthWrite: false,
+                blending: THREE.NoBlending
+            });
+
+            splatMaterial = new THREE.ShaderMaterial({
+                vertexShader: document.getElementById('vertexShader').textContent,
+                fragmentShader: document.getElementById('splatShader').textContent,
+                uniforms: {
+                    uTarget: { value: null },     // Set dynamically
+                    aspectRatio: { value: window.innerWidth / window.innerHeight },
+                    color: { value: new THREE.Vector3() }, // Set dynamically
+                    point: { value: new THREE.Vector2() }, // Set dynamically
+                    radius: { value: SPLAT_RADIUS }
+                },
+                depthTest: false,
+                depthWrite: false,
+                blending: THREE.NoBlending // Additive blending might be desired for density sometimes
+            });
+
+            divergenceMaterial = new THREE.ShaderMaterial({
+                vertexShader: document.getElementById('vertexShader').textContent,
+                fragmentShader: document.getElementById('divergenceShader').textContent,
+                uniforms: {
+                    uVelocity: { value: null }, // Set dynamically
+                    texelSize: { value: simTexelSize }
+                },
+                depthTest: false,
+                depthWrite: false,
+                blending: THREE.NoBlending
+            });
+
+             pressureMaterial = new THREE.ShaderMaterial({
+                vertexShader: document.getElementById('vertexShader').textContent,
+                fragmentShader: document.getElementById('pressureShader').textContent,
+                uniforms: {
+                    uPressure: { value: null }, // Set dynamically
+                    uDivergence: { value: divergenceRT.texture },
+                    texelSize: { value: simTexelSize }
+                },
+                depthTest: false,
+                depthWrite: false,
+                blending: THREE.NoBlending
+            });
+
+            gradientSubtractMaterial = new THREE.ShaderMaterial({
+                vertexShader: document.getElementById('vertexShader').textContent,
+                fragmentShader: document.getElementById('gradientSubtractShader').textContent,
+                uniforms: {
+                    uPressure: { value: null }, // Set dynamically
+                    uVelocity: { value: null }, // Set dynamically
+                    texelSize: { value: simTexelSize }
+                },
+                depthTest: false,
+                depthWrite: false,
+                blending: THREE.NoBlending
+            });
+
+            displayMaterial = new THREE.ShaderMaterial({
+                vertexShader: document.getElementById('vertexShader').textContent,
+                fragmentShader: document.getElementById('displayShader').textContent,
+                uniforms: {
+                    uTexture: { value: null } // Set dynamically (densityRT1.texture)
+                },
+                depthTest: false,
+                depthWrite: false,
+                blending: THREE.NoBlending // Or AlphaBlending if rendering over something
+            });
+        }
+
+        // --- Quad Mesh Creation ---
+        function createQuadMesh() {
+            const geometry = new THREE.PlaneGeometry(1, 1); // Unit plane
+            // We use a single mesh and change its material for each pass
+            quadMesh = new THREE.Mesh(geometry);
+            scene.add(quadMesh); // Add to the scene once
+        }
+
+        // --- Render Pass Helper ---
+        function renderPass(material, target) {
+            quadMesh.material = material; // Set the material for this pass
+            renderer.setRenderTarget(target); // Set the output render target
+            // renderer.clear(); // Usually not needed if shader writes all pixels
+            renderer.render(scene, camera); // Render the quad
+            renderer.setRenderTarget(null); // Reset render target
+        }
+
+        // --- Swap Render Targets ---
+        function swapVelocity() { [velocityRT1, velocityRT2] = [velocityRT2, velocityRT1]; }
+        function swapDensity() { [densityRT1, densityRT2] = [densityRT2, densityRT1]; }
+        function swapPressure() { [pressureRT1, pressureRT2] = [pressureRT2, pressureRT1]; }
+
+        // --- Simulation Step ---
+        function step(dt) {
+            const simTexelSize = new THREE.Vector2(1.0 / simWidth, 1.0 / simHeight);
+            const dyeTexelSize = new THREE.Vector2(1.0 / dyeWidth, 1.0 / dyeHeight);
+
+            // 1. Advect Velocity
+            advectionMaterial.uniforms.uVelocity.value = velocityRT1.texture;
+            advectionMaterial.uniforms.uSource.value = velocityRT1.texture; // Advect itself
+            advectionMaterial.uniforms.dissipation.value = VELOCITY_DISSIPATION;
+            advectionMaterial.uniforms.dt.value = dt;
+            advectionMaterial.uniforms.texelSize.value = simTexelSize; // Important: Use sim resolution
+            renderPass(advectionMaterial, velocityRT2);
+            swapVelocity();
+
+            // 2. Advect Density (Dye)
+            advectionMaterial.uniforms.uVelocity.value = velocityRT1.texture; // Use latest velocity
+            advectionMaterial.uniforms.uSource.value = densityRT1.texture;
+            advectionMaterial.uniforms.dissipation.value = DENSITY_DISSIPATION;
+            advectionMaterial.uniforms.dt.value = dt;
+            advectionMaterial.uniforms.texelSize.value = dyeTexelSize; // Important: Use dye resolution texel size if different
+            renderPass(advectionMaterial, densityRT2);
+            swapDensity();
+
+            // 3. Apply Mouse Splats (Forces and Density)
+            if (mouse.moved) {
+                 // Splat Velocity
+                splatMaterial.uniforms.uTarget.value = velocityRT1.texture;
+                splatMaterial.uniforms.point.value.set(mouse.x, mouse.y);
+                splatMaterial.uniforms.color.value.set(mouse.dx * SPLAT_FORCE, mouse.dy * SPLAT_FORCE, 0.0);
+                splatMaterial.uniforms.radius.value = SPLAT_RADIUS * (window.innerWidth / window.innerHeight); // Adjust radius based on aspect ratio
+                renderPass(splatMaterial, velocityRT2);
+                swapVelocity();
+
+                // Splat Density
+                splatMaterial.uniforms.uTarget.value = densityRT1.texture;
+                // Generate a random color for the splat
+                const splatColor = new THREE.Color();
+                splatColor.setHSL(Math.random(), 1.0, 0.5); // Random hue, full saturation, half lightness
+                splatMaterial.uniforms.color.value.set(splatColor.r * SPLAT_DENSITY, splatColor.g * SPLAT_DENSITY, splatColor.b * SPLAT_DENSITY);
+                renderPass(splatMaterial, densityRT2);
+                swapDensity();
+
+                mouse.moved = false; // Reset moved flag after applying splat
+            }
+
+
+            // --- Pressure Projection ---
+            // 4. Calculate Divergence
+            divergenceMaterial.uniforms.uVelocity.value = velocityRT1.texture; // Use advected+splatted velocity
+            renderPass(divergenceMaterial, divergenceRT);
+
+            // 5. Solve Pressure (Jacobi Iterations)
+            pressureMaterial.uniforms.uDivergence.value = divergenceRT.texture;
+            // Clear initial pressure guess (optional, can start from previous frame)
+            // renderPass(clearMaterial, pressureRT1); // Need a clear material if starting from 0
+
+            for (let i = 0; i < PRESSURE_ITERATIONS; i++) {
+                pressureMaterial.uniforms.uPressure.value = pressureRT1.texture;
+                renderPass(pressureMaterial, pressureRT2);
+                swapPressure();
+            }
+
+            // 6. Subtract Gradient
+            gradientSubtractMaterial.uniforms.uPressure.value = pressureRT1.texture; // Use final solved pressure
+            gradientSubtractMaterial.uniforms.uVelocity.value = velocityRT1.texture; // Use velocity before gradient subtraction
+            renderPass(gradientSubtractMaterial, velocityRT2);
+            swapVelocity(); // Final velocity is now in velocityRT1
+        }
+
+        // --- Animation Loop ---
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const dt = Math.min(clock.getDelta(), 0.017); // Get delta time, clamp to avoid large steps
+
+            // Run the simulation step
+            step(dt);
+
+            // Render the final density to the screen
+            displayMaterial.uniforms.uTexture.value = densityRT1.texture;
+            renderPass(displayMaterial, null); // Render to screen (null target)
+        }
+
+        // --- Event Listeners ---
+        function addEventListeners() {
+            window.addEventListener('resize', onWindowResize);
+            window.addEventListener('mousemove', onMouseMove);
+            window.addEventListener('mousedown', onMouseDown);
+            window.addEventListener('mouseup', onMouseUp);
+             window.addEventListener('touchstart', onTouchStart, { passive: false });
+            window.addEventListener('touchmove', onTouchMove, { passive: false });
+            window.addEventListener('touchend', onTouchEnd);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight; // Update camera aspect if perspective
+             // For Orthographic, adjust bounds if needed, or recalculate resolution
+            renderer.setSize(window.innerWidth, window.innerHeight);
+
+             // Recalculate simulation/dye resolutions and resize render targets
+            calculateResolution();
+            resizeRenderTargets(); // Implement this function if needed
+
+            // Update aspect ratio uniform for splats
+            splatMaterial.uniforms.aspectRatio.value = window.innerWidth / window.innerHeight;
+        }
+
+         function resizeRenderTargets() {
+            // This is simplified. A full implementation would recreate or resize
+            // all render targets based on the new simWidth, simHeight, etc.
+            // For now, we'll just log a message. A full resize is complex.
+            console.log("Window resized, consider implementing full render target resizing.");
+             // Example (would need to be done for all RTs):
+             // velocityRT1.setSize(simWidth, simHeight);
+             // velocityRT2.setSize(simWidth, simHeight);
+             // ... etc ...
+             // Also update texelSize uniforms
+             // advectionMaterial.uniforms.texelSize.value.set(1.0 / simWidth, 1.0 / simHeight);
+             // ... etc ...
+        }
+
+        function updateMousePosition(clientX, clientY) {
+             const rect = renderer.domElement.getBoundingClientRect();
+             const x = clientX - rect.left;
+             const y = clientY - rect.top;
+
+            const newX = x / rect.width; // Normalize to [0, 1]
+            const newY = 1.0 - (y / rect.height); // Normalize and flip Y
+
+            if (mouse.isDown) { // Only calculate delta if mouse is down
+                 mouse.dx = (newX - mouse.x) * 5.0; // Amplify delta slightly
+                 mouse.dy = (newY - mouse.y) * 5.0;
+                 mouse.moved = Math.abs(mouse.dx) > 0.001 || Math.abs(mouse.dy) > 0.001; // Check if moved significantly
+            } else {
+                 mouse.dx = 0;
+                 mouse.dy = 0;
+                 mouse.moved = false;
+             }
+
+             mouse.x = newX;
+             mouse.y = newY;
+        }
+
+
+        function onMouseMove(event) {
+            updateMousePosition(event.clientX, event.clientY);
+        }
+
+        function onMouseDown(event) {
+            mouse.isDown = true;
+            updateMousePosition(event.clientX, event.clientY); // Update position on down
+             // Reset dx/dy on initial click
+            mouse.dx = 0;
+            mouse.dy = 0;
+            mouse.moved = true; // Force a splat on click
+        }
+
+        function onMouseUp() {
+            mouse.isDown = false;
+            mouse.moved = false; // Stop splatting force
+        }
+
+         // --- Touch Event Handlers ---
+         function onTouchStart(event) {
+            event.preventDefault(); // Prevent default touch actions like scrolling
+            if (event.touches.length > 0) {
+                mouse.isDown = true;
+                updateMousePosition(event.touches[0].clientX, event.touches[0].clientY);
+                 mouse.dx = 0;
+                 mouse.dy = 0;
+                 mouse.moved = true; // Force splat on touch start
+            }
+        }
+
+        function onTouchMove(event) {
+            event.preventDefault();
+            if (event.touches.length > 0 && mouse.isDown) {
+                updateMousePosition(event.touches[0].clientX, event.touches[0].clientY);
+            }
+        }
+
+        function onTouchEnd() {
+            mouse.isDown = false;
+            mouse.moved = false;
+        }
+
+        // --- Start ---
+        init();
+
+    </script>
+</body>
+</html>
